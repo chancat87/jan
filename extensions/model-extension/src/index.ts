@@ -1,374 +1,287 @@
 import {
-  fs,
-  downloadFile,
-  abortDownload,
-  getResourcePath,
-  InferenceEngine,
-  joinPath,
   ModelExtension,
   Model,
-  getJanDataFolderPath,
+  InferenceEngine,
+  joinPath,
+  dirName,
+  fs,
+  ModelManager,
+  abortDownload,
+  DownloadState,
+  events,
+  DownloadEvent,
+  OptionType,
 } from '@janhq/core'
+import { CortexAPI } from './cortex'
+import { scanModelsFolder } from './legacy/model-json'
+import { downloadModel } from './legacy/download'
+import { systemInformation } from '@janhq/core'
+import { deleteModelFiles } from './legacy/delete'
+
+export enum Settings {
+  huggingfaceToken = 'hugging-face-access-token',
+}
 
 /**
  * A extension for models
  */
 export default class JanModelExtension extends ModelExtension {
-  private static readonly _homeDir = 'file://models'
-  private static readonly _modelMetadataFileName = 'model.json'
-  private static readonly _supportedModelFormat = '.gguf'
-  private static readonly _incompletedModelFileName = '.download'
-  private static readonly _offlineInferenceEngine = InferenceEngine.nitro
-
-  private static readonly _configDirName = 'config'
-  private static readonly _defaultModelFileName = 'default-model.json'
+  cortexAPI: CortexAPI = new CortexAPI()
 
   /**
    * Called when the extension is loaded.
    * @override
    */
   async onLoad() {
-    this.copyModelsToHomeDir()
+    this.registerSettings(SETTINGS)
+
+    // Configure huggingface token if available
+    const huggingfaceToken = await this.getSetting<string>(
+      Settings.huggingfaceToken,
+      undefined
+    )
+    if (huggingfaceToken)
+      this.cortexAPI.configs({ huggingface_token: huggingfaceToken })
+
+    // Listen to app download events
+    this.handleDesktopEvents()
+  }
+
+  /**
+   * Subscribe to settings update and make change accordingly
+   * @param key
+   * @param value
+   */
+  onSettingUpdate<T>(key: string, value: T): void {
+    if (key === Settings.huggingfaceToken) {
+      this.cortexAPI.configs({ huggingface_token: value })
+    }
   }
 
   /**
    * Called when the extension is unloaded.
    * @override
    */
-  onUnload(): void {}
-
-  private async copyModelsToHomeDir() {
-    try {
-      // Check for migration conditions
-      if (
-        localStorage.getItem(`${EXTENSION_NAME}-version`) === VERSION &&
-        (await fs.existsSync(JanModelExtension._homeDir))
-      ) {
-        // ignore if the there is no need to migrate
-        console.debug('Models already persisted.')
-        return
-      }
-      // copy models folder from resources to home directory
-      const resourePath = await getResourcePath()
-      const srcPath = await joinPath([resourePath, 'models'])
-
-      const janDataFolderPath = await getJanDataFolderPath()
-      const destPath = await joinPath([janDataFolderPath, 'models'])
-
-      await fs.syncFile(srcPath, destPath)
-
-      console.debug('Finished syncing models')
-
-      // Finished migration
-      localStorage.setItem(`${EXTENSION_NAME}-version`, VERSION)
-    } catch (err) {
-      console.error(err)
-    }
-  }
+  async onUnload() {}
 
   /**
    * Downloads a machine learning model.
    * @param model - The model to download.
-   * @param network - Optional object to specify proxy/whether to ignore SSL certificates.
    * @returns A Promise that resolves when the model is downloaded.
    */
-  async downloadModel(
-    model: Model,
-    network?: { ignoreSSL?: boolean; proxy?: string }
-  ): Promise<void> {
-    // create corresponding directory
-    const modelDirPath = await joinPath([JanModelExtension._homeDir, model.id])
-    if (!(await fs.existsSync(modelDirPath))) await fs.mkdirSync(modelDirPath)
-
-    if (model.sources.length > 1) {
-      // path to model binaries
-      for (const source of model.sources) {
-        let path = this.extractFileName(source.url)
-        if (source.filename) {
-          path = await joinPath([modelDirPath, source.filename])
-        }
-
-        downloadFile(source.url, path, network)
+  async pullModel(model: string, id?: string, name?: string): Promise<void> {
+    if (id) {
+      const model: Model = ModelManager.instance().get(id)
+      // Clip vision model - should not be handled by cortex.cpp
+      // TensorRT model - should not be handled by cortex.cpp
+      if (
+        model &&
+        (model.engine === InferenceEngine.nitro_tensorrt_llm ||
+          model.settings.vision_model)
+      ) {
+        return downloadModel(model, (await systemInformation()).gpuSetting)
       }
-    } else {
-      const fileName = this.extractFileName(model.sources[0]?.url)
-      const path = await joinPath([modelDirPath, fileName])
-      downloadFile(model.sources[0]?.url, path, network)
     }
-  }
-
-  /**
-   *  try to retrieve the download file name from the source url
-   */
-  private extractFileName(url: string): string {
-    const extractedFileName = url.split('/').pop()
-    const fileName = extractedFileName
-      .toLowerCase()
-      .endsWith(JanModelExtension._supportedModelFormat)
-      ? extractedFileName
-      : extractedFileName + JanModelExtension._supportedModelFormat
-    return fileName
+    /**
+     * Sending POST to /models/pull/{id} endpoint to pull the model
+     */
+    return this.cortexAPI.pullModel(model, id, name)
   }
 
   /**
    * Cancels the download of a specific machine learning model.
-   * @param {string} modelId - The ID of the model whose download is to be cancelled.
+   *
+   * @param {string} model - The ID of the model whose download is to be cancelled.
    * @returns {Promise<void>} A promise that resolves when the download has been cancelled.
    */
-  async cancelModelDownload(modelId: string): Promise<void> {
-    const model = await this.getConfiguredModels()
-    return abortDownload(
-      await joinPath([JanModelExtension._homeDir, modelId, modelId])
-    ).then(async () => {
-      fs.unlinkSync(
-        await joinPath([JanModelExtension._homeDir, modelId, modelId])
-      )
-    })
+  async cancelModelPull(model: string): Promise<void> {
+    if (model) {
+      const modelDto: Model = ModelManager.instance().get(model)
+      // Clip vision model - should not be handled by cortex.cpp
+      // TensorRT model - should not be handled by cortex.cpp
+      if (
+        modelDto &&
+        (modelDto.engine === InferenceEngine.nitro_tensorrt_llm ||
+          modelDto.settings.vision_model)
+      ) {
+        for (const source of modelDto.sources) {
+          const path = await joinPath(['models', modelDto.id, source.filename])
+          await abortDownload(path)
+        }
+      }
+    }
+    /**
+     * Sending DELETE to /models/pull/{id} endpoint to cancel a model pull
+     */
+    return this.cortexAPI.cancelModelPull(model)
   }
 
   /**
-   * Deletes a machine learning model.
-   * @param filePath - The path to the model file to delete.
+   * Deletes a pulled model
+   * @param model - The model to delete
    * @returns A Promise that resolves when the model is deleted.
    */
-  async deleteModel(modelId: string): Promise<void> {
-    try {
-      const dirPath = await joinPath([JanModelExtension._homeDir, modelId])
-
-      // remove all files under dirPath except model.json
-      const files = await fs.readdirSync(dirPath)
-      const deletePromises = files.map(async (fileName: string) => {
-        if (fileName !== JanModelExtension._modelMetadataFileName) {
-          return fs.unlinkSync(await joinPath([dirPath, fileName]))
-        }
+  async deleteModel(model: string): Promise<void> {
+    return this.cortexAPI
+      .deleteModel(model)
+      .catch((e) => console.debug(e))
+      .finally(async () => {
+        // Delete legacy model files
+        await deleteModelFiles(model).catch((e) => console.debug(e))
       })
-      await Promise.allSettled(deletePromises)
-    } catch (err) {
-      console.error(err)
-    }
   }
 
   /**
-   * Saves a machine learning model.
-   * @param model - The model to save.
-   * @returns A Promise that resolves when the model is saved.
-   */
-  async saveModel(model: Model): Promise<void> {
-    const jsonFilePath = await joinPath([
-      JanModelExtension._homeDir,
-      model.id,
-      JanModelExtension._modelMetadataFileName,
-    ])
-
-    try {
-      await fs.writeFileSync(jsonFilePath, JSON.stringify(model, null, 2))
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  /**
-   * Gets all downloaded models.
+   * Gets all pulled models
    * @returns A Promise that resolves with an array of all models.
    */
-  async getDownloadedModels(): Promise<Model[]> {
-    return await this.getModelsMetadata(
-      async (modelDir: string, model: Model) => {
-        if (model.engine !== JanModelExtension._offlineInferenceEngine) {
-          return true
-        }
-        return await fs
-          .readdirSync(await joinPath([JanModelExtension._homeDir, modelDir]))
-          .then((files: string[]) => {
-            // or model binary exists in the directory
-            // model binary name can match model ID or be a .gguf file and not be an incompleted model file
-            // TODO: Check diff between urls, filenames
-            return (
-              files.includes(modelDir) ||
-              files.filter(
-                (file) =>
-                  file
-                    .toLowerCase()
-                    .includes(JanModelExtension._supportedModelFormat) &&
-                  !file.endsWith(JanModelExtension._incompletedModelFileName)
-              )?.length >= model.sources.length
-            )
-          })
-      }
+  async getModels(): Promise<Model[]> {
+    /**
+     * Legacy models should be supported
+     */
+    let legacyModels = await scanModelsFolder()
+
+    /**
+     * Here we are filtering out the models that are not imported
+     * and are not using llama.cpp engine
+     */
+    var toImportModels = legacyModels.filter(
+      (e) => e.engine === InferenceEngine.nitro
     )
-  }
 
-  private async getModelsMetadata(
-    selector?: (path: string, model: Model) => Promise<boolean>
-  ): Promise<Model[]> {
-    try {
-      if (!(await fs.existsSync(JanModelExtension._homeDir))) {
-        console.debug('Model folder not found')
-        return []
-      }
+    /**
+     * Fetch models from cortex.cpp
+     */
+    var fetchedModels = await this.cortexAPI.getModels().catch(() => [])
 
-      const files: string[] = await fs.readdirSync(JanModelExtension._homeDir)
+    // Checking if there are models to import
+    const existingIds = fetchedModels.map((e) => e.id)
+    toImportModels = toImportModels.filter(
+      (e: Model) => !existingIds.includes(e.id) && !e.settings?.vision_model
+    )
 
-      const allDirectories: string[] = []
-      for (const file of files) {
-        if (file === '.DS_Store') continue
-        if (file === 'config') continue
-        allDirectories.push(file)
-      }
+    /**
+     * There is no model to import
+     * just return fetched models
+     */
+    if (!toImportModels.length)
+      return fetchedModels.concat(
+        legacyModels.filter((e) => !fetchedModels.some((x) => x.id === e.id))
+      )
 
-      const readJsonPromises = allDirectories.map(async (dirName) => {
-        // filter out directories that don't match the selector
-        // read model.json
-        const jsonPath = await joinPath([
-          JanModelExtension._homeDir,
-          dirName,
-          JanModelExtension._modelMetadataFileName,
-        ])
-
-        if (await fs.existsSync(jsonPath)) {
-          // if we have the model.json file, read it
-          let model = await this.readModelMetadata(jsonPath)
-          model = typeof model === 'object' ? model : JSON.parse(model)
-
-          if (selector && !(await selector?.(dirName, model))) {
-            return
-          }
-          return model
-        } else {
-          // otherwise, we generate our own model file
-          // TODO: we might have more than one binary file here. This will be addressed with new version of Model file
-          //  which is the PR from Hiro on branch Jan can see
-          return this.generateModelMetadata(dirName)
-        }
-      })
-      const results = await Promise.allSettled(readJsonPromises)
-      const modelData = results.map((result) => {
-        if (result.status === 'fulfilled') {
-          try {
-            // This to ensure backward compatibility with `model.json` with `source_url`
-            const tmpModel =
-              typeof result.value === 'object'
-                ? result.value
-                : JSON.parse(result.value)
-            if (tmpModel['source_url'] != null) {
-              tmpModel['source'] = [
-                {
-                  filename: tmpModel.id,
-                  url: tmpModel['source_url'],
-                },
-              ]
-            }
-
-            return tmpModel as Model
-          } catch {
-            console.debug(`Unable to parse model metadata: ${result.value}`)
-            return undefined
-          }
-        } else {
-          console.error(result.reason)
-          return undefined
-        }
-      })
-
-      return modelData.filter((e) => !!e)
-    } catch (err) {
-      console.error(err)
-      return []
+    console.log('To import models:', toImportModels.length)
+    /**
+     * There are models to import
+     */
+    if (toImportModels.length > 0) {
+      // Import models
+      await Promise.all(
+        toImportModels.map(async (model: Model & { file_path: string }) => {
+          return this.importModel(
+            model.id,
+            model.sources[0].url.startsWith('http') ||
+              !(await fs.existsSync(model.sources[0].url))
+              ? await joinPath([
+                  await dirName(model.file_path),
+                  model.sources[0]?.filename ??
+                    model.settings?.llama_model_path ??
+                    model.sources[0]?.url.split('/').pop() ??
+                    model.id,
+                ]) // Copied models
+              : model.sources[0].url, // Symlink models,
+            model.name
+          )
+            .then((e) => {
+              this.updateModel({
+                id: model.id,
+                ...model.settings,
+                ...model.parameters,
+              } as Partial<Model>)
+            })
+            .catch((e) => {
+              console.debug(e)
+            })
+        })
+      )
     }
-  }
 
-  private readModelMetadata(path: string) {
-    return fs.readFileSync(path, 'utf-8')
+    /**
+     * Models are imported successfully before
+     * Now return models from cortex.cpp and merge with legacy models which are not imported
+     */
+    return await this.cortexAPI
+      .getModels()
+      .then((models) => {
+        return models.concat(
+          legacyModels.filter((e) => !models.some((x) => x.id === e.id))
+        )
+      })
+      .catch(() => Promise.resolve(legacyModels))
   }
 
   /**
-   * Handle the case where we have the model directory but we don't have the corresponding
-   * model.json file associated with it.
-   *
-   * This function will create a model.json file for the model.
-   *
-   * @param dirName the director which reside in ~/jan/models but does not have model.json file.
+   * Update a pulled model metadata
+   * @param model - The metadata of the model
    */
-  private async generateModelMetadata(dirName: string): Promise<Model> {
-    const files: string[] = await fs.readdirSync(
-      await joinPath([JanModelExtension._homeDir, dirName])
-    )
-
-    // sort files by name
-    files.sort()
-
-    // find the first file which is not a directory
-    let binaryFileName: string | undefined = undefined
-    let binaryFileSize: number | undefined = undefined
-
-    for (const file of files) {
-      if (file.endsWith(JanModelExtension._incompletedModelFileName)) continue
-      if (file.endsWith('.json')) continue
-
-      const path = await joinPath([JanModelExtension._homeDir, dirName, file])
-      const fileStats = await fs.fileStat(path)
-      if (fileStats.isDirectory) continue
-      binaryFileSize = fileStats.size
-      binaryFileName = file
-      break
-    }
-
-    if (!binaryFileName) {
-      console.warn(`Unable to find binary file for model ${dirName}`)
-      return
-    }
-
-    const defaultModel = await this.getDefaultModel()
-    if (!defaultModel) {
-      console.error('Unable to find default model')
-      return
-    }
-
-    const model: Model = {
-      ...defaultModel,
-      id: dirName,
-      name: dirName,
-      created: Date.now(),
-      description: `${dirName} - user self import model`,
-      metadata: {
-        size: binaryFileSize,
-        author: 'User',
-        tags: [],
-      },
-    }
-
-    const modelFilePath = await joinPath([
-      JanModelExtension._homeDir,
-      dirName,
-      JanModelExtension._modelMetadataFileName,
-    ])
-
-    await fs.writeFileSync(modelFilePath, JSON.stringify(model, null, 2))
-
-    return model
-  }
-
-  private async getDefaultModel(): Promise<Model | undefined> {
-    const defaultModelPath = await joinPath([
-      JanModelExtension._homeDir,
-      JanModelExtension._configDirName,
-      JanModelExtension._defaultModelFileName,
-    ])
-
-    if (!(await fs.existsSync(defaultModelPath))) {
-      return undefined
-    }
-
-    const model = await this.readModelMetadata(defaultModelPath)
-
-    return typeof model === 'object' ? model : JSON.parse(model)
+  async updateModel(model: Partial<Model>): Promise<Model> {
+    return this.cortexAPI
+      ?.updateModel(model)
+      .then(() => this.cortexAPI!.getModel(model.id))
   }
 
   /**
-   * Gets all available models.
-   * @returns A Promise that resolves with an array of all models.
+   * Import an existing model file
+   * @param model
+   * @param optionType
    */
-  async getConfiguredModels(): Promise<Model[]> {
-    return this.getModelsMetadata()
+  async importModel(
+    model: string,
+    modelPath: string,
+    name?: string,
+    option?: OptionType
+  ): Promise<void> {
+    return this.cortexAPI.importModel(model, modelPath, name, option)
+  }
+
+  /**
+   * Check model status
+   * @param model
+   */
+  async isModelLoaded(model: string): Promise<boolean> {
+    return this.cortexAPI.getModelStatus(model)
+  }
+
+  /**
+   * Configure pull options such as proxy, headers, etc.
+   */
+  async configurePullOptions(options: { [key: string]: any }): Promise<any> {
+    return this.cortexAPI.configs(options).catch((e) => console.debug(e))
+  }
+
+  /**
+   * Handle download state from main app
+   */
+  handleDesktopEvents() {
+    if (window && window.electronAPI) {
+      window.electronAPI.onFileDownloadUpdate(
+        async (_event: string, state: DownloadState | undefined) => {
+          if (!state) return
+          state.downloadState = 'downloading'
+          events.emit(DownloadEvent.onFileDownloadUpdate, state)
+        }
+      )
+      window.electronAPI.onFileDownloadError(
+        async (_event: string, state: DownloadState) => {
+          state.downloadState = 'error'
+          events.emit(DownloadEvent.onFileDownloadError, state)
+        }
+      )
+      window.electronAPI.onFileDownloadSuccess(
+        async (_event: string, state: DownloadState) => {
+          state.downloadState = 'end'
+          events.emit(DownloadEvent.onFileDownloadSuccess, state)
+        }
+      )
+    }
   }
 }

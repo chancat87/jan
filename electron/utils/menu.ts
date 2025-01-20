@@ -1,19 +1,42 @@
 // @ts-nocheck
-import { app, Menu, dialog, shell } from 'electron'
-const isMac = process.platform === 'darwin'
+import { app, Menu, shell, dialog } from 'electron'
 import { autoUpdater } from 'electron-updater'
-import { compareSemanticVersions } from './versionDiff'
+import { log } from '@janhq/core/node'
+const isMac = process.platform === 'darwin'
+import { windowManager } from '../managers/window'
 
 const template: (Electron.MenuItemConstructorOptions | Electron.MenuItem)[] = [
   {
     label: app.name,
     submenu: [
-      { role: 'about' },
+      {
+        label: `About ${app.name}`,
+        click: () =>
+          dialog.showMessageBox({
+            title: `Jan`,
+            message: `Jan Version v${app.getVersion()}\n\nCopyright © 2024 Jan`,
+          }),
+      },
       {
         label: 'Check for Updates...',
         click: () =>
           // Check for updates and notify user if there are any
-          autoUpdater.checkForUpdatesAndNotify(),
+          autoUpdater
+            .checkForUpdatesAndNotify()
+            .then((updateCheckResult) => {
+              if (
+                !updateCheckResult?.updateInfo ||
+                updateCheckResult?.updateInfo.version === app.getVersion()
+              ) {
+                dialog.showMessageBox({
+                  message: `No updates available.`,
+                })
+                return
+              }
+            })
+            .catch((error) => {
+              log('Error checking for updates:' + JSON.stringify(error))
+            }),
       },
       { type: 'separator' },
       { role: 'services' },
@@ -21,6 +44,14 @@ const template: (Electron.MenuItemConstructorOptions | Electron.MenuItem)[] = [
       { role: 'hide' },
       { role: 'hideOthers' },
       { role: 'unhide' },
+      {
+        label: `Settings`,
+        accelerator: 'CmdOrCtrl+,',
+        click: () => {
+          windowManager.showMainWindow()
+          windowManager.sendMainViewState('Settings')
+        },
+      },
       { type: 'separator' },
       { role: 'quit' },
     ],
@@ -90,7 +121,8 @@ const template: (Electron.MenuItemConstructorOptions | Electron.MenuItem)[] = [
   },
 ]
 
+export const menu = Menu.buildFromTemplate(template)
+
 export const setupMenu = () => {
-  const menu = Menu.buildFromTemplate(template)
   Menu.setApplicationMenu(menu)
 }

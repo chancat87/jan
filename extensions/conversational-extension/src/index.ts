@@ -1,89 +1,71 @@
 import {
-  fs,
-  joinPath,
   ConversationalExtension,
   Thread,
+  ThreadAssistantInfo,
   ThreadMessage,
-  events,
 } from '@janhq/core'
+import ky from 'ky'
+import PQueue from 'p-queue'
+
+type ThreadList = {
+  data: Thread[]
+}
+
+type MessageList = {
+  data: ThreadMessage[]
+}
 
 /**
  * JSONConversationalExtension is a ConversationalExtension implementation that provides
  * functionality for managing threads.
  */
-export default class JSONConversationalExtension extends ConversationalExtension {
-  private static readonly _homeDir = 'file://threads'
-  private static readonly _threadInfoFileName = 'thread.json'
-  private static readonly _threadMessagesFileName = 'messages.jsonl'
+export default class CortexConversationalExtension extends ConversationalExtension {
+  queue = new PQueue({ concurrency: 1 })
 
   /**
    * Called when the extension is loaded.
    */
   async onLoad() {
-    if (!(await fs.existsSync(JSONConversationalExtension._homeDir)))
-      await fs.mkdirSync(JSONConversationalExtension._homeDir)
-    console.debug('JSONConversationalExtension loaded')
+    this.queue.add(() => this.healthz())
   }
 
   /**
    * Called when the extension is unloaded.
    */
-  onUnload() {
-    console.debug('JSONConversationalExtension unloaded')
-  }
+  onUnload() {}
 
   /**
    * Returns a Promise that resolves to an array of Conversation objects.
    */
-  async getThreads(): Promise<Thread[]> {
-    try {
-      const threadDirs = await this.getValidThreadDirs()
-
-      const promises = threadDirs.map((dirName) => this.readThread(dirName))
-      const promiseResults = await Promise.allSettled(promises)
-      const convos = promiseResults
-        .map((result) => {
-          if (result.status === 'fulfilled') {
-            return typeof result.value === 'object'
-              ? result.value
-              : JSON.parse(result.value)
-          }
-        })
-        .filter((convo) => convo != null)
-      convos.sort(
-        (a, b) => new Date(b.updated).getTime() - new Date(a.updated).getTime()
-      )
-
-      return convos
-    } catch (error) {
-      console.error(error)
-      return []
-    }
+  async listThreads(): Promise<Thread[]> {
+    return this.queue.add(() =>
+      ky
+        .get(`${API_URL}/v1/threads?limit=-1`)
+        .json<ThreadList>()
+        .then((e) => e.data)
+    ) as Promise<Thread[]>
   }
 
   /**
    * Saves a Thread object to a json file.
    * @param thread The Thread object to save.
    */
-  async saveThread(thread: Thread): Promise<void> {
-    try {
-      const threadDirPath = await joinPath([
-        JSONConversationalExtension._homeDir,
-        thread.id,
-      ])
-      const threadJsonPath = await joinPath([
-        threadDirPath,
-        JSONConversationalExtension._threadInfoFileName,
-      ])
-      if (!(await fs.existsSync(threadDirPath))) {
-        await fs.mkdirSync(threadDirPath)
-      }
+  async createThread(thread: Thread): Promise<Thread> {
+    return this.queue.add(() =>
+      ky.post(`${API_URL}/v1/threads`, { json: thread }).json<Thread>()
+    ) as Promise<Thread>
+  }
 
-      await fs.writeFileSync(threadJsonPath, JSON.stringify(thread, null, 2))
-    } catch (err) {
-      console.error(err)
-      Promise.reject(err)
-    }
+  /**
+   * Saves a Thread object to a json file.
+   * @param thread The Thread object to save.
+   */
+  async modifyThread(thread: Thread): Promise<void> {
+    return this.queue
+      .add(() =>
+        ky.post(`${API_URL}/v1/threads/${thread.id}`, { json: thread })
+      )
+      .then()
   }
 
   /**
@@ -91,199 +73,128 @@ export default class JSONConversationalExtension extends ConversationalExtension
    * @param threadId The ID of the thread to delete.
    */
   async deleteThread(threadId: string): Promise<void> {
-    const path = await joinPath([
-      JSONConversationalExtension._homeDir,
-      `${threadId}`,
-    ])
-    try {
-      if (await fs.existsSync(path)) {
-        await fs.rmdirSync(path, { recursive: true })
-      } else {
-        console.debug(`${path} does not exist`)
-      }
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  async addNewMessage(message: ThreadMessage): Promise<void> {
-    try {
-      const threadDirPath = await joinPath([
-        JSONConversationalExtension._homeDir,
-        message.thread_id,
-      ])
-      const threadMessagePath = await joinPath([
-        threadDirPath,
-        JSONConversationalExtension._threadMessagesFileName,
-      ])
-      if (!(await fs.existsSync(threadDirPath)))
-        await fs.mkdirSync(threadDirPath)
-
-      if (message.content[0]?.type === 'image') {
-        const filesPath = await joinPath([threadDirPath, 'files'])
-        if (!(await fs.existsSync(filesPath))) await fs.mkdirSync(filesPath)
-
-        const imagePath = await joinPath([filesPath, `${message.id}.png`])
-        const base64 = message.content[0].text.annotations[0]
-        await this.storeImage(base64, imagePath)
-        if ((await fs.existsSync(imagePath)) && message.content?.length) {
-          // Use file path instead of blob
-          message.content[0].text.annotations[0] = `threads/${message.thread_id}/files/${message.id}.png`
-        }
-      }
-
-      if (message.content[0]?.type === 'pdf') {
-        const filesPath = await joinPath([threadDirPath, 'files'])
-        if (!(await fs.existsSync(filesPath))) await fs.mkdirSync(filesPath)
-
-        const filePath = await joinPath([filesPath, `${message.id}.pdf`])
-        const blob = message.content[0].text.annotations[0]
-        await this.storeFile(blob, filePath)
-
-        if ((await fs.existsSync(filePath)) && message.content?.length) {
-          // Use file path instead of blob
-          message.content[0].text.annotations[0] = `threads/${message.thread_id}/files/${message.id}.pdf`
-        }
-      }
-      await fs.appendFileSync(threadMessagePath, JSON.stringify(message) + '\n')
-      Promise.resolve()
-    } catch (err) {
-      Promise.reject(err)
-    }
-  }
-
-  async storeImage(base64: string, filePath: string): Promise<void> {
-    const base64Data = base64.replace(/^data:image\/\w+;base64,/, '')
-
-    try {
-      await fs.writeBlob(filePath, base64Data)
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  async storeFile(base64: string, filePath: string): Promise<void> {
-    const base64Data = base64.replace(/^data:application\/pdf;base64,/, '')
-    try {
-      await fs.writeBlob(filePath, base64Data)
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  async writeMessages(
-    threadId: string,
-    messages: ThreadMessage[]
-  ): Promise<void> {
-    try {
-      const threadDirPath = await joinPath([
-        JSONConversationalExtension._homeDir,
-        threadId,
-      ])
-      const threadMessagePath = await joinPath([
-        threadDirPath,
-        JSONConversationalExtension._threadMessagesFileName,
-      ])
-      if (!(await fs.existsSync(threadDirPath)))
-        await fs.mkdirSync(threadDirPath)
-      await fs.writeFileSync(
-        threadMessagePath,
-        messages.map((msg) => JSON.stringify(msg)).join('\n') +
-          (messages.length ? '\n' : '')
-      )
-      Promise.resolve()
-    } catch (err) {
-      Promise.reject(err)
-    }
+    return this.queue
+      .add(() => ky.delete(`${API_URL}/v1/threads/${threadId}`))
+      .then()
   }
 
   /**
-   * A promise builder for reading a thread from a file.
-   * @param threadDirName the thread dir we are reading from.
-   * @returns data of the thread
+   * Adds a new message to a specified thread.
+   * @param message The ThreadMessage object to be added.
+   * @returns A Promise that resolves when the message has been added.
    */
-  private async readThread(threadDirName: string): Promise<any> {
-    return fs.readFileSync(
-      await joinPath([
-        JSONConversationalExtension._homeDir,
-        threadDirName,
-        JSONConversationalExtension._threadInfoFileName,
-      ]),
-      'utf-8'
-    )
+  async createMessage(message: ThreadMessage): Promise<ThreadMessage> {
+    return this.queue.add(() =>
+      ky
+        .post(`${API_URL}/v1/threads/${message.thread_id}/messages`, {
+          json: message,
+        })
+        .json<ThreadMessage>()
+    ) as Promise<ThreadMessage>
   }
 
   /**
-   * Returns a Promise that resolves to an array of thread directories.
-   * @private
+   * Modifies a message in a thread.
+   * @param message
+   * @returns
    */
-  private async getValidThreadDirs(): Promise<string[]> {
-    const fileInsideThread: string[] = await fs.readdirSync(
-      JSONConversationalExtension._homeDir
-    )
-
-    const threadDirs: string[] = []
-    for (let i = 0; i < fileInsideThread.length; i++) {
-      if (fileInsideThread[i].includes('.DS_Store')) continue
-      const path = await joinPath([
-        JSONConversationalExtension._homeDir,
-        fileInsideThread[i],
-      ])
-
-      const isHavingThreadInfo = (await fs.readdirSync(path)).includes(
-        JSONConversationalExtension._threadInfoFileName
-      )
-      if (!isHavingThreadInfo) {
-        console.debug(`Ignore ${path} because it does not have thread info`)
-        continue
-      }
-
-      threadDirs.push(fileInsideThread[i])
-    }
-    return threadDirs
-  }
-
-  async getAllMessages(threadId: string): Promise<ThreadMessage[]> {
-    try {
-      const threadDirPath = await joinPath([
-        JSONConversationalExtension._homeDir,
-        threadId,
-      ])
-
-      const files: string[] = await fs.readdirSync(threadDirPath)
-      if (
-        !files.includes(JSONConversationalExtension._threadMessagesFileName)
-      ) {
-        console.debug(`${threadDirPath} not contains message file`)
-        return []
-      }
-
-      const messageFilePath = await joinPath([
-        threadDirPath,
-        JSONConversationalExtension._threadMessagesFileName,
-      ])
-
-      const result = await fs
-        .readFileSync(messageFilePath, 'utf-8')
-        .then((content) =>
-          content
-            .toString()
-            .split('\n')
-            .filter((line) => line !== '')
+  async modifyMessage(message: ThreadMessage): Promise<ThreadMessage> {
+    return this.queue.add(() =>
+      ky
+        .post(
+          `${API_URL}/v1/threads/${message.thread_id}/messages/${message.id}`,
+          {
+            json: message,
+          }
         )
+        .json<ThreadMessage>()
+    ) as Promise<ThreadMessage>
+  }
 
-      const messages: ThreadMessage[] = []
-      result.forEach((line: string) => {
-        try {
-          messages.push(JSON.parse(line) as ThreadMessage)
-        } catch (err) {
-          console.error(err)
-        }
+  /**
+   * Deletes a specific message from a thread.
+   * @param threadId The ID of the thread containing the message.
+   * @param messageId The ID of the message to be deleted.
+   * @returns A Promise that resolves when the message has been successfully deleted.
+   */
+  async deleteMessage(threadId: string, messageId: string): Promise<void> {
+    return this.queue
+      .add(() =>
+        ky.delete(`${API_URL}/v1/threads/${threadId}/messages/${messageId}`)
+      )
+      .then()
+  }
+
+  /**
+   * Retrieves all messages for a specified thread.
+   * @param threadId The ID of the thread to get messages from.
+   * @returns A Promise that resolves to an array of ThreadMessage objects.
+   */
+  async listMessages(threadId: string): Promise<ThreadMessage[]> {
+    return this.queue.add(() =>
+      ky
+        .get(`${API_URL}/v1/threads/${threadId}/messages?order=asc&limit=-1`)
+        .json<MessageList>()
+        .then((e) => e.data)
+    ) as Promise<ThreadMessage[]>
+  }
+
+  /**
+   * Retrieves the assistant information for a specified thread.
+   * @param threadId The ID of the thread for which to retrieve assistant information.
+   * @returns A Promise that resolves to a ThreadAssistantInfo object containing
+   * the details of the assistant associated with the specified thread.
+   */
+  async getThreadAssistant(threadId: string): Promise<ThreadAssistantInfo> {
+    return this.queue.add(() =>
+      ky
+        .get(`${API_URL}/v1/assistants/${threadId}?limit=-1`)
+        .json<ThreadAssistantInfo>()
+    ) as Promise<ThreadAssistantInfo>
+  }
+  /**
+   * Creates a new assistant for the specified thread.
+   * @param threadId The ID of the thread for which the assistant is being created.
+   * @param assistant The information about the assistant to be created.
+   * @returns A Promise that resolves to the newly created ThreadAssistantInfo object.
+   */
+  async createThreadAssistant(
+    threadId: string,
+    assistant: ThreadAssistantInfo
+  ): Promise<ThreadAssistantInfo> {
+    return this.queue.add(() =>
+      ky
+        .post(`${API_URL}/v1/assistants/${threadId}`, { json: assistant })
+        .json<ThreadAssistantInfo>()
+    ) as Promise<ThreadAssistantInfo>
+  }
+
+  /**
+   * Modifies an existing assistant for the specified thread.
+   * @param threadId The ID of the thread for which the assistant is being modified.
+   * @param assistant The updated information for the assistant.
+   * @returns A Promise that resolves to the updated ThreadAssistantInfo object.
+   */
+  async modifyThreadAssistant(
+    threadId: string,
+    assistant: ThreadAssistantInfo
+  ): Promise<ThreadAssistantInfo> {
+    return this.queue.add(() =>
+      ky
+        .patch(`${API_URL}/v1/assistants/${threadId}`, { json: assistant })
+        .json<ThreadAssistantInfo>()
+    ) as Promise<ThreadAssistantInfo>
+  }
+
+  /**
+   * Do health check on cortex.cpp
+   * @returns
+   */
+  async healthz(): Promise<void> {
+    return ky
+      .get(`${API_URL}/healthz`, {
+        retry: { limit: 20, delay: () => 500, methods: ['get'] },
       })
-      return messages
-    } catch (err) {
-      console.error(err)
-      return []
-    }
+      .then(() => {})
   }
 }

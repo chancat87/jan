@@ -1,13 +1,16 @@
-export const toGibibytes = (input: number) => {
+export const toGibibytes = (
+  input: number,
+  options?: { hideUnit?: boolean }
+) => {
   if (!input) return ''
   if (input > 1024 ** 3) {
-    return (input / 1024 ** 3).toFixed(2) + 'GB'
+    return (input / 1024 ** 3).toFixed(2) + (options?.hideUnit ? '' : 'GB')
   } else if (input > 1024 ** 2) {
-    return (input / 1024 ** 2).toFixed(2) + 'MB'
+    return (input / 1024 ** 2).toFixed(2) + (options?.hideUnit ? '' : 'MB')
   } else if (input > 1024) {
-    return (input / 1024).toFixed(2) + 'KB'
+    return (input / 1024).toFixed(2) + (options?.hideUnit ? '' : 'KB')
   } else {
-    return input + 'B'
+    return input + (options?.hideUnit ? '' : 'B')
   }
 }
 
@@ -15,8 +18,8 @@ export const formatDownloadPercentage = (
   input: number,
   options?: { hidePercentage?: boolean }
 ) => {
-  if (options?.hidePercentage) return input * 100
-  return (input * 100).toFixed(2) + '%'
+  if (options?.hidePercentage) return input <= 1 ? input * 100 : input
+  return (input <= 1 ? input * 100 : (input ?? 0)).toFixed(2) + '%'
 }
 
 export const formatDownloadSpeed = (input: number | undefined) => {

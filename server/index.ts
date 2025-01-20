@@ -1,26 +1,23 @@
-import fastify from "fastify";
-import dotenv from "dotenv";
-import {
-  getServerLogPath,
-  v1Router,
-  logServer,
-  getJanExtensionsPath,
-} from "@janhq/core/node";
-import { join } from "path";
+import fastify from 'fastify'
+import dotenv from 'dotenv'
+import { log } from '@janhq/core/node'
+import tcpPortUsed from 'tcp-port-used'
+import { Logger } from './helpers/logger'
+import CORTEX_SCHEMA from './cortex.json'
 
 // Load environment variables
-dotenv.config();
+dotenv.config()
 
 // Define default settings
-const JAN_API_HOST = process.env.JAN_API_HOST || "127.0.0.1";
-const JAN_API_PORT = Number.parseInt(process.env.JAN_API_PORT || "1337");
+const JAN_API_HOST = process.env.JAN_API_HOST || '127.0.0.1'
+const JAN_API_PORT = Number.parseInt(process.env.JAN_API_PORT || '1337')
 
 // Initialize server settings
-let server: any | undefined = undefined;
-let hostSetting: string = JAN_API_HOST;
-let portSetting: number = JAN_API_PORT;
-let corsEnabled: boolean = true;
-let isVerbose: boolean = true;
+let server: any | undefined = undefined
+let hostSetting: string = JAN_API_HOST
+let portSetting: number = JAN_API_PORT
+let corsEnabled: boolean = true
+let isVerbose: boolean = true
 
 /**
  * Server configurations
@@ -32,79 +29,79 @@ let isVerbose: boolean = true;
  * @param baseDir - Base directory for the OpenAPI schema file
  */
 export interface ServerConfig {
-  host?: string;
-  port?: number;
-  isCorsEnabled?: boolean;
-  isVerboseEnabled?: boolean;
-  schemaPath?: string;
-  baseDir?: string;
+  host?: string
+  port?: number
+  isCorsEnabled?: boolean
+  isVerboseEnabled?: boolean
+  schemaPath?: string
+  baseDir?: string
+  prefix?: string
+  storageAdataper?: any
 }
 
 /**
  * Function to start the server
  * @param configs - Server configurations
  */
-export const startServer = async (configs?: ServerConfig) => {
+export const startServer = async (configs?: ServerConfig): Promise<boolean> => {
+  if (configs?.port && configs?.host) {
+    const inUse = await tcpPortUsed.check(Number(configs.port), configs.host)
+    if (inUse) {
+      const errorMessage = `Port ${configs.port} is already in use.`
+      log(errorMessage, '[SERVER]')
+      throw new Error(errorMessage)
+    }
+  }
+
   // Update server settings
-  isVerbose = configs?.isVerboseEnabled ?? true;
-  hostSetting = configs?.host ?? JAN_API_HOST;
-  portSetting = configs?.port ?? JAN_API_PORT;
-  corsEnabled = configs?.isCorsEnabled ?? true;
-  const serverLogPath = getServerLogPath();
+  isVerbose = configs?.isVerboseEnabled ?? true
+  hostSetting = configs?.host ?? JAN_API_HOST
+  portSetting = configs?.port ?? JAN_API_PORT
+  corsEnabled = configs?.isCorsEnabled ?? true
 
   // Start the server
   try {
     // Log server start
-    if (isVerbose) logServer(`Debug: Starting JAN API server...`);
+    if (isVerbose) log(`Debug: Starting JAN API server...`, '[SERVER]')
 
     // Initialize Fastify server with logging
     server = fastify({
-      logger: {
-        level: "info",
-        file: serverLogPath,
-      },
-    });
+      loggerInstance: new Logger(),
+      // Set body limit to 100MB - Default is 1MB
+      // According to OpenAI - a batch input file can be up to 100 MB in size
+      // Whisper endpoints accept up to 25MB
+      // Vision endpoints accept up to 4MB
+      bodyLimit: 104_857_600,
+    })
 
     // Register CORS if enabled
-    if (corsEnabled) await server.register(require("@fastify/cors"), {});
+    if (corsEnabled) await server.register(require('@fastify/cors'), {})
 
+    CORTEX_SCHEMA.servers[0].url = configs?.prefix ?? '/v1'
     // Register Swagger for API documentation
-    await server.register(require("@fastify/swagger"), {
-      mode: "static",
+    await server.register(require('@fastify/swagger'), {
+      mode: 'static',
       specification: {
-        path: configs?.schemaPath ?? "./../docs/openapi/jan.yaml",
-        baseDir: configs?.baseDir ?? "./../docs/openapi",
+        document: CORTEX_SCHEMA,
       },
-    });
+    })
 
     // Register Swagger UI
-    await server.register(require("@fastify/swagger-ui"), {
-      routePrefix: "/",
-      baseDir: configs?.baseDir ?? join(__dirname, "../..", "./docs/openapi"),
+    await server.register(require('@fastify/swagger-ui'), {
+      routePrefix: '/',
       uiConfig: {
-        docExpansion: "full",
+        docExpansion: 'full',
         deepLinking: false,
       },
       staticCSP: false,
       transformSpecificationClone: true,
-    });
+    })
 
-    // Register static file serving for extensions
-    // TODO: Watch extension files changes and reload
-    await server.register(
-      (childContext: any, _: any, done: any) => {
-        childContext.register(require("@fastify/static"), {
-          root: getJanExtensionsPath(),
-          wildcard: false,
-        });
-
-        done();
-      },
-      { prefix: "extensions" }
-    );
-
-    // Register API routes
-    await server.register(v1Router, { prefix: "/v1" });
+    server.register(require('@fastify/http-proxy'), {
+      upstream: 'http://127.0.0.1:39291/v1',
+      prefix: configs?.prefix ?? '/v1',
+      http2: false,
+    })
 
     // Start listening for requests
     await server
@@ -115,15 +112,18 @@ export const startServer = async (configs?: ServerConfig) => {
       .then(() => {
         // Log server listening
         if (isVerbose)
-          logServer(
-            `Debug: JAN API listening at: http://${hostSetting}:${portSetting}`
-          );
-      });
+          log(
+            `Debug: JAN API listening at: http://${hostSetting}:${portSetting}`,
+            '[SERVER]'
+          )
+      })
+    return true
   } catch (e) {
     // Log any errors
-    if (isVerbose) logServer(`Error: ${e}`);
+    if (isVerbose) log(`Error: ${e}`, '[SERVER]')
   }
-};
+  return false
+}
 
 /**
  * Function to stop the server
@@ -131,11 +131,11 @@ export const startServer = async (configs?: ServerConfig) => {
 export const stopServer = async () => {
   try {
     // Log server stop
-    if (isVerbose) logServer(`Debug: Server stopped`);
+    if (isVerbose) log(`Debug: Server stopped`, '[SERVER]')
     // Stop the server
-    await server.close();
+    await server?.close()
   } catch (e) {
     // Log any errors
-    if (isVerbose) logServer(`Error: ${e}`);
+    if (isVerbose) log(`Error: ${e}`, '[SERVER]')
   }
-};
+}

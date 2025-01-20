@@ -1,118 +1,175 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+import { useCallback, useEffect } from 'react'
 
-import { PropsWithChildren, useEffect, useRef } from 'react'
+import React from 'react'
 
-import { baseName } from '@janhq/core'
-import { useAtomValue, useSetAtom } from 'jotai'
+import {
+  DownloadEvent,
+  events,
+  DownloadState,
+  ModelEvent,
+  ExtensionTypeEnum,
+  ModelExtension,
+  ModelManager,
+  Model,
+} from '@janhq/core'
 
-import { useDownloadState } from '@/hooks/useDownloadState'
-import { useGetDownloadedModels } from '@/hooks/useGetDownloadedModels'
+import { useSetAtom } from 'jotai'
 
-import { modelBinFileName } from '@/utils/model'
+import { setDownloadStateAtom } from '@/hooks/useDownloadState'
 
-import EventHandler from './EventHandler'
+import { formatExtensionsName } from '@/utils/converter'
 
-import { appDownloadProgress } from './Jotai'
+import { toaster } from '../Toast'
 
-import { downloadingModelsAtom } from '@/helpers/atoms/Model.atom'
+import AppUpdateListener from './AppUpdateListener'
+import ClipboardListener from './ClipboardListener'
+import ModelHandler from './ModelHandler'
 
-export default function EventListenerWrapper({ children }: PropsWithChildren) {
-  const setProgress = useSetAtom(appDownloadProgress)
-  const models = useAtomValue(downloadingModelsAtom)
-  const modelsRef = useRef(models)
+import ModelImportListener from './ModelImportListener'
+import QuickAskListener from './QuickAskListener'
 
-  const { setDownloadedModels, downloadedModels } = useGetDownloadedModels()
-  const {
-    setDownloadState,
-    setDownloadStateSuccess,
-    setDownloadStateFailed,
-    setDownloadStateCancelled,
-  } = useDownloadState()
-  const downloadedModelRef = useRef(downloadedModels)
+import { extensionManager } from '@/extension'
+import {
+  InstallingExtensionState,
+  removeInstallingExtensionAtom,
+  setInstallingExtensionAtom,
+} from '@/helpers/atoms/Extension.atom'
+import {
+  addDownloadingModelAtom,
+  removeDownloadingModelAtom,
+} from '@/helpers/atoms/Model.atom'
 
-  useEffect(() => {
-    modelsRef.current = models
-  }, [models])
-  useEffect(() => {
-    downloadedModelRef.current = downloadedModels
-  }, [downloadedModels])
+const EventListener = () => {
+  const setDownloadState = useSetAtom(setDownloadStateAtom)
+  const setInstallingExtension = useSetAtom(setInstallingExtensionAtom)
+  const removeInstallingExtension = useSetAtom(removeInstallingExtensionAtom)
+  const addDownloadingModel = useSetAtom(addDownloadingModelAtom)
+  const removeDownloadingModel = useSetAtom(removeDownloadingModelAtom)
 
-  useEffect(() => {
-    if (window && window.electronAPI) {
-      window.electronAPI.onFileDownloadUpdate(
-        async (_event: string, state: any | undefined) => {
-          if (!state) return
-          const modelName = await baseName(state.fileName)
-          const model = modelsRef.current.find(
-            (model) => modelBinFileName(model) === modelName
-          )
-          if (model)
-            setDownloadState({
-              ...state,
-              modelId: model.id,
-            })
+  const onFileDownloadUpdate = useCallback(
+    async (state: DownloadState) => {
+      console.debug('onFileDownloadUpdate', state)
+      if (state.downloadType === 'extension') {
+        const installingExtensionState: InstallingExtensionState = {
+          extensionId: state.extensionId!,
+          percentage: state.percent,
+          localPath: state.localPath,
         }
-      )
+        setInstallingExtension(state.extensionId!, installingExtensionState)
+      } else {
+        addDownloadingModel(state.modelId)
+        setDownloadState(state)
+      }
+    },
+    [addDownloadingModel, setDownloadState, setInstallingExtension]
+  )
 
-      window.electronAPI.onFileDownloadError(
-        async (_event: string, state: any) => {
-          const modelName = await baseName(state.fileName)
-          const model = modelsRef.current.find(
-            (model) => modelBinFileName(model) === modelName
-          )
-          if (model) {
-            if (state.err?.message !== 'aborted') {
-              console.error('Download error', state)
-              setDownloadStateFailed(model.id, state.err.message)
-            } else {
-              setDownloadStateCancelled(model.id)
-            }
-          }
+  const onFileDownloadError = useCallback(
+    (state: DownloadState) => {
+      console.debug('onFileDownloadError', state)
+      if (state.downloadType === 'extension') {
+        removeInstallingExtension(state.extensionId!)
+      } else {
+        state.downloadState = 'error'
+        setDownloadState(state)
+        removeDownloadingModel(state.modelId)
+      }
+    },
+    [removeInstallingExtension, setDownloadState, removeDownloadingModel]
+  )
+
+  const onFileDownloadStopped = useCallback(
+    (state: DownloadState) => {
+      console.debug('onFileDownloadError', state)
+      if (state.downloadType === 'extension') {
+        removeInstallingExtension(state.extensionId!)
+      } else {
+        state.downloadState = 'error'
+        state.error = 'aborted'
+        setDownloadState(state)
+        removeDownloadingModel(state.modelId)
+      }
+    },
+    [removeInstallingExtension, setDownloadState, removeDownloadingModel]
+  )
+
+  const onFileDownloadSuccess = useCallback(
+    async (state: DownloadState) => {
+      console.debug('onFileDownloadSuccess', state)
+      if (state.downloadType !== 'extension') {
+        // Update model metadata accordingly
+        const model = ModelManager.instance().models.get(state.modelId)
+        if (model) {
+          await extensionManager
+            .get<ModelExtension>(ExtensionTypeEnum.Model)
+            ?.updateModel({
+              id: model.id,
+              ...model.settings,
+              ...model.parameters,
+            } as Partial<Model>)
+            .catch((e) => console.debug(e))
+
+          toaster({
+            title: 'Download Completed',
+            description: `Download ${state.modelId} completed`,
+            type: 'success',
+          })
         }
-      )
+        state.downloadState = 'end'
+        setDownloadState(state)
+        removeDownloadingModel(state.modelId)
+        events.emit(ModelEvent.OnModelsUpdate, { fetch: true })
+      }
+    },
+    [removeDownloadingModel, setDownloadState]
+  )
 
-      window.electronAPI.onFileDownloadSuccess(
-        async (_event: string, state: any) => {
-          if (state && state.fileName) {
-            const modelName = await baseName(state.fileName)
-            const model = modelsRef.current.find(
-              (model) => modelBinFileName(model) === modelName
-            )
-            if (model) {
-              setDownloadStateSuccess(model.id)
-              setDownloadedModels([...downloadedModelRef.current, model])
-            }
-          }
-        }
-      )
-
-      window.electronAPI.onAppUpdateDownloadUpdate(
-        (_event: string, progress: any) => {
-          setProgress(progress.percent)
-          console.debug('app update progress:', progress.percent)
-        }
-      )
-
-      window.electronAPI.onAppUpdateDownloadError(
-        (_event: string, callback: any) => {
-          console.error('Download error', callback)
-          setProgress(-1)
-        }
-      )
-
-      window.electronAPI.onAppUpdateDownloadSuccess(() => {
-        setProgress(-1)
+  const onFileUnzipSuccess = useCallback(
+    (state: DownloadState) => {
+      console.debug('onFileUnzipSuccess', state)
+      toaster({
+        title: 'Success',
+        description: `Install ${formatExtensionsName(state.extensionId!)} successfully.`,
+        type: 'success',
       })
+      removeInstallingExtension(state.extensionId!)
+    },
+    [removeInstallingExtension]
+  )
+
+  useEffect(() => {
+    console.debug('EventListenerWrapper: registering event listeners...')
+    events.on(DownloadEvent.onFileDownloadUpdate, onFileDownloadUpdate)
+    events.on(DownloadEvent.onFileDownloadError, onFileDownloadError)
+    events.on(DownloadEvent.onFileDownloadSuccess, onFileDownloadSuccess)
+    events.on(DownloadEvent.onFileDownloadStopped, onFileDownloadStopped)
+    events.on(DownloadEvent.onFileUnzipSuccess, onFileUnzipSuccess)
+
+    return () => {
+      console.debug('EventListenerWrapper: unregistering event listeners...')
+      events.off(DownloadEvent.onFileDownloadUpdate, onFileDownloadUpdate)
+      events.off(DownloadEvent.onFileDownloadError, onFileDownloadError)
+      events.off(DownloadEvent.onFileDownloadSuccess, onFileDownloadSuccess)
+      events.off(DownloadEvent.onFileDownloadStopped, onFileDownloadStopped)
+      events.off(DownloadEvent.onFileUnzipSuccess, onFileUnzipSuccess)
     }
-    return () => {}
   }, [
-    setDownloadState,
-    setDownloadStateCancelled,
-    setDownloadStateFailed,
-    setDownloadStateSuccess,
-    setDownloadedModels,
-    setProgress,
+    onFileDownloadUpdate,
+    onFileDownloadError,
+    onFileDownloadSuccess,
+    onFileUnzipSuccess,
+    onFileDownloadStopped,
   ])
 
-  return <EventHandler>{children}</EventHandler>
+  return (
+    <>
+      <AppUpdateListener />
+      <ClipboardListener />
+      <ModelImportListener />
+      <QuickAskListener />
+      <ModelHandler />
+    </>
+  )
 }
+
+export default EventListener

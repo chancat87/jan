@@ -1,11 +1,13 @@
 .vscode
+.idea
 .env
+.idea
 
 # Jan inference
 error.log
 node_modules
 *.tgz
-yarn.lock
+!charts/server/charts/*.tgz
 dist
 build
 .DS_Store
@@ -13,19 +15,39 @@ electron/renderer
 electron/models
 electron/docs
 electron/engines
+electron/themes
+electron/playwright-report
 server/pre-install
 package-lock.json
-
+coverage
 *.log
 core/lib/**
 
 # Nitro binary files
-extensions/inference-nitro-extension/bin/*/nitro
-extensions/inference-nitro-extension/bin/*/*.metal
-extensions/inference-nitro-extension/bin/*/*.exe
-extensions/inference-nitro-extension/bin/*/*.dll
-extensions/inference-nitro-extension/bin/*/*.exp
-extensions/inference-nitro-extension/bin/*/*.lib
-extensions/inference-nitro-extension/bin/saved-*
-extensions/inference-nitro-extension/bin/*.tar.gz
+extensions/*-extension/bin/*/nitro
+extensions/*-extension/bin/*/*.metal
+extensions/*-extension/bin/*/*.exe
+extensions/*-extension/bin/*/*.dll
+extensions/*-extension/bin/*/*.exp
+extensions/*-extension/bin/*/*.lib
+extensions/*-extension/bin/saved-*
+extensions/*-extension/bin/*.tar.gz
+extensions/*-extension/bin/vulkaninfoSDK.exe
+extensions/*-extension/bin/vulkaninfo
 
+
+# Turborepo
+.turbo
+electron/test-data
+electron/test-results
+core/test_results.html
+coverage
+.yarn
+.yarnrc
+test_results.html
+*.tsbuildinfo
+electron/shared/**
+
+# docs
+docs/yarn.lock
+electron/.version.bak

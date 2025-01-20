@@ -1,59 +1,83 @@
-import { useEffect, useState } from 'react'
+import { useCallback } from 'react'
 
-import { fs, AppConfiguration, joinPath, getUserHomePath } from '@janhq/core'
+import { fs, AppConfiguration, EngineManager } from '@janhq/core'
+import { atom, useAtomValue, useSetAtom } from 'jotai'
+
+import { useActiveModel } from './useActiveModel'
+
+import { defaultJanDataFolderAtom } from '@/helpers/atoms/App.atom'
+
+export enum FactoryResetState {
+  Idle = 'idle',
+  Starting = 'starting',
+  StoppingModel = 'stopping_model',
+  DeletingData = 'deleting_data',
+  ClearLocalStorage = 'clear_local_storage',
+}
+
+export const factoryResetStateAtom = atom(FactoryResetState.Idle)
 
 export default function useFactoryReset() {
-  const [defaultJanDataFolder, setdefaultJanDataFolder] = useState('')
+  const defaultJanDataFolder = useAtomValue(defaultJanDataFolderAtom)
+  const { stopModel } = useActiveModel()
+  const setFactoryResetState = useSetAtom(factoryResetStateAtom)
 
-  useEffect(() => {
-    async function getDefaultJanDataFolder() {
-      const homePath = await getUserHomePath()
-      const defaultJanDataFolder = await joinPath([homePath, 'jan'])
-      setdefaultJanDataFolder(defaultJanDataFolder)
-    }
-    getDefaultJanDataFolder()
-  }, [])
+  const resetAll = useCallback(
+    async (keepCurrentFolder?: boolean) => {
+      setFactoryResetState(FactoryResetState.Starting)
+      // read the place of jan data folder
+      const appConfiguration: AppConfiguration | undefined =
+        await window.core?.api?.getAppConfigurations()
 
-  const resetAll = async (keepCurrentFolder?: boolean) => {
-    // read the place of jan data folder
-    const appConfiguration: AppConfiguration | undefined =
-      await window.core?.api?.getAppConfigurations()
+      if (!appConfiguration) {
+        console.debug('Failed to get app configuration')
+      }
 
-    if (!appConfiguration) {
-      console.debug('Failed to get app configuration')
-    }
+      const janDataFolderPath = appConfiguration!.data_folder
+      // 1: Stop running model
+      setFactoryResetState(FactoryResetState.StoppingModel)
+      await stopModel()
 
-    console.debug('appConfiguration: ', appConfiguration)
-    const janDataFolderPath = appConfiguration!.data_folder
+      await Promise.all(
+        EngineManager.instance()
+          .engines.values()
+          .map(async (engine) => {
+            await engine.onUnload()
+          })
+      )
 
-    if (defaultJanDataFolder === janDataFolderPath) {
-      console.debug('Jan data folder is already at user home')
-    } else {
-      // if jan data folder is not at user home, we update the app configuration to point to user home
+      await new Promise((resolve) => setTimeout(resolve, 4000))
+
+      // 2: Delete the old jan data folder
+      setFactoryResetState(FactoryResetState.DeletingData)
+      await fs.rm(janDataFolderPath)
+
+      // 3: Set the default jan data folder
       if (!keepCurrentFolder) {
+        // set the default jan data folder to user's home directory
         const configuration: AppConfiguration = {
           data_folder: defaultJanDataFolder,
+          quick_ask: appConfiguration?.quick_ask ?? false,
         }
         await window.core?.api?.updateAppConfiguration(configuration)
       }
-    }
 
-    const modelPath = await joinPath([janDataFolderPath, 'models'])
-    const threadPath = await joinPath([janDataFolderPath, 'threads'])
+      // Perform factory reset
+      await window.core?.api?.factoryReset()
 
-    console.debug(`Removing models at ${modelPath}`)
-    await fs.rmdirSync(modelPath, { recursive: true })
+      // 4: Clear app local storage
+      setFactoryResetState(FactoryResetState.ClearLocalStorage)
+      // reset the localStorage
+      localStorage.clear()
 
-    console.debug(`Removing threads at ${threadPath}`)
-    await fs.rmdirSync(threadPath, { recursive: true })
-
-    // reset the localStorage
-    localStorage.clear()
-    await window.core?.api?.relaunch()
-  }
+      window.core = undefined
+      // 5: Relaunch the app
+      window.location.reload()
+    },
+    [defaultJanDataFolder, stopModel, setFactoryResetState]
+  )
 
   return {
-    defaultJanDataFolder,
     resetAll,
   }
 }

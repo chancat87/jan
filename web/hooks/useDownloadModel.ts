@@ -1,79 +1,69 @@
-import { useContext } from 'react'
+import { useCallback } from 'react'
 
-import {
-  Model,
-  ExtensionTypeEnum,
-  ModelExtension,
-  abortDownload,
-  joinPath,
-  ModelArtifact,
-} from '@janhq/core'
+import { ExtensionTypeEnum, ModelExtension } from '@janhq/core'
 
 import { useSetAtom } from 'jotai'
 
-import { FeatureToggleContext } from '@/context/FeatureToggle'
+import { toaster } from '@/containers/Toast'
 
-import { modelBinFileName } from '@/utils/model'
-
-import { useDownloadState } from './useDownloadState'
+import { setDownloadStateAtom } from './useDownloadState'
 
 import { extensionManager } from '@/extension/ExtensionManager'
-import { addNewDownloadingModelAtom } from '@/helpers/atoms/Model.atom'
+
+import {
+  addDownloadingModelAtom,
+  removeDownloadingModelAtom,
+} from '@/helpers/atoms/Model.atom'
 
 export default function useDownloadModel() {
-  const { ignoreSSL, proxy } = useContext(FeatureToggleContext)
-  const { setDownloadState } = useDownloadState()
-  const addNewDownloadingModel = useSetAtom(addNewDownloadingModelAtom)
+  const removeDownloadingModel = useSetAtom(removeDownloadingModelAtom)
+  const addDownloadingModel = useSetAtom(addDownloadingModelAtom)
+  const setDownloadStates = useSetAtom(setDownloadStateAtom)
 
-  const downloadModel = async (model: Model) => {
-    const childrenDownloadProgress: DownloadState[] = []
-    model.sources.forEach((source: ModelArtifact) => {
-      childrenDownloadProgress.push({
-        modelId: source.filename,
-        time: {
-          elapsed: 0,
-          remaining: 0,
-        },
-        speed: 0,
-        percent: 0,
+  const downloadModel = useCallback(
+    async (model: string, id?: string, name?: string) => {
+      addDownloadingModel(id ?? model)
+      setDownloadStates({
+        modelId: id ?? model,
+        downloadState: 'downloading',
+        fileName: id ?? model,
         size: {
           total: 0,
           transferred: 0,
         },
+        percent: 0,
       })
-    })
+      downloadLocalModel(model, id, name).catch((error) => {
+        if (error.message) {
+          toaster({
+            title: 'Download failed',
+            description: error.message,
+            type: 'error',
+          })
+        }
 
-    // set an initial download state
-    setDownloadState({
-      modelId: model.id,
-      time: {
-        elapsed: 0,
-        remaining: 0,
-      },
-      speed: 0,
-      percent: 0,
-      size: {
-        total: 0,
-        transferred: 0,
-      },
-      children: childrenDownloadProgress,
-    })
+        removeDownloadingModel(model)
+      })
+    },
+    [removeDownloadingModel, addDownloadingModel, setDownloadStates]
+  )
 
-    addNewDownloadingModel(model)
-
-    await extensionManager
-      .get<ModelExtension>(ExtensionTypeEnum.Model)
-      ?.downloadModel(model, { ignoreSSL, proxy })
-  }
-
-  const abortModelDownload = async (model: Model) => {
-    await abortDownload(
-      await joinPath(['models', model.id, modelBinFileName(model)])
-    )
-  }
+  const abortModelDownload = useCallback(async (model: string) => {
+    await cancelModelDownload(model)
+  }, [])
 
   return {
     downloadModel,
     abortModelDownload,
   }
 }
+
+const downloadLocalModel = async (model: string, id?: string, name?: string) =>
+  extensionManager
+    .get<ModelExtension>(ExtensionTypeEnum.Model)
+    ?.pullModel(model, id, name)
+
+const cancelModelDownload = async (model: string) =>
+  extensionManager
+    .get<ModelExtension>(ExtensionTypeEnum.Model)
+    ?.cancelModelPull(model)

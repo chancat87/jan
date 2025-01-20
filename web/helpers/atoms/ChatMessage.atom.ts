@@ -6,16 +6,53 @@ import {
 } from '@janhq/core'
 import { atom } from 'jotai'
 
+import { atomWithStorage } from 'jotai/utils'
+
 import {
   getActiveThreadIdAtom,
   updateThreadStateLastMessageAtom,
 } from './Thread.atom'
 
+import { TokenSpeed } from '@/types/token'
+
+const CHAT_MESSAGE_NAME = 'chatMessages'
 /**
  * Stores all chat messages for all threads
  */
-export const chatMessages = atom<Record<string, ThreadMessage[]>>({})
+export const chatMessagesStorage = atomWithStorage<
+  Record<string, ThreadMessage[]>
+>(CHAT_MESSAGE_NAME, {}, undefined, { getOnInit: true })
 
+export const cachedMessages = atom<Record<string, ThreadMessage[]>>()
+/**
+ * Retrieve chat messages for all threads
+ */
+export const chatMessages = atom(
+  (get) => get(cachedMessages) ?? get(chatMessagesStorage),
+  (_get, set, newValue: Record<string, ThreadMessage[]>) => {
+    set(cachedMessages, newValue)
+    ;(() => set(chatMessagesStorage, newValue))()
+  }
+)
+
+/**
+ * Store subscribed generating message thread
+ */
+export const subscribedGeneratingMessageAtom = atom<{
+  thread_id?: string
+}>({})
+
+/**
+ * Stores the status of the messages load for each thread
+ */
+export const readyThreadsMessagesAtom = atomWithStorage<
+  Record<string, boolean>
+>('currentThreadMessages', {}, undefined, { getOnInit: true })
+
+/**
+ * Store the token speed for current message
+ */
+export const tokenSpeedAtom = atom<TokenSpeed | undefined>(undefined)
 /**
  * Return the chat messages for the current active conversation
  */
@@ -23,6 +60,7 @@ export const getCurrentChatMessagesAtom = atom<ThreadMessage[]>((get) => {
   const activeThreadId = get(getActiveThreadIdAtom)
   if (!activeThreadId) return []
   const messages = get(chatMessages)[activeThreadId]
+  if (!Array.isArray(messages)) return []
   return messages ?? []
 })
 
@@ -34,6 +72,10 @@ export const setConvoMessagesAtom = atom(
     }
     newData[threadId] = messages
     set(chatMessages, newData)
+    set(readyThreadsMessagesAtom, {
+      ...get(readyThreadsMessagesAtom),
+      [threadId]: true,
+    })
   }
 )
 
@@ -70,11 +112,12 @@ export const addNewMessageAtom = atom(
     set(chatMessages, newData)
 
     // Update thread last message
-    set(
-      updateThreadStateLastMessageAtom,
-      newMessage.thread_id,
-      newMessage.content
-    )
+    if (newMessage.content.length)
+      set(
+        updateThreadStateLastMessageAtom,
+        newMessage.thread_id,
+        newMessage.content
+      )
   }
 )
 
@@ -103,10 +146,16 @@ export const deleteMessageAtom = atom(null, (get, set, id: string) => {
   }
   const threadId = get(getActiveThreadIdAtom)
   if (threadId) {
-    newData[threadId] = newData[threadId].filter((e) => e.id !== id)
+    // Should also delete error messages to clear out the error state
+    newData[threadId] = newData[threadId].filter(
+      (e) => e.id !== id && !e.metadata?.error
+    )
+
     set(chatMessages, newData)
   }
 })
+
+export const editMessageAtom = atom('')
 
 export const updateMessageAtom = atom(
   null,
@@ -131,7 +180,19 @@ export const updateMessageAtom = atom(
       newData[conversationId] = updatedMessages
       set(chatMessages, newData)
       // Update thread last message
-      set(updateThreadStateLastMessageAtom, conversationId, text)
+      if (text.length)
+        set(updateThreadStateLastMessageAtom, conversationId, text)
+    } else {
+      set(addNewMessageAtom, {
+        id,
+        thread_id: conversationId,
+        content: text,
+        status,
+        role: ChatCompletionRole.Assistant,
+        created_at: Date.now() / 1000,
+        completed_at: Date.now() / 1000,
+        object: 'thread.message',
+      })
     }
   }
 )
